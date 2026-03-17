@@ -58,7 +58,6 @@ starlette==0.50.0
 sympy==1.14.0
 textstat==0.7.12
 tld==0.13.1
-torch==2.9.1
 tqdm==4.67.2
 trafilatura==2.0.0
 triton==3.5.1
