@@ -45,12 +45,6 @@ class AiriaSNN(nn.Module):
         self.lif3 = snn.Leaky(beta=beta)
 
     def forward_snapshot(self, x, num_steps=25):
-        """
-        Snapshot mode: runs num_steps internal timesteps on a single
-        feature vector. Used for end-of-session classification and for
-        training, where we need stable gradients over multiple steps.
-        The 25 steps here are simulation steps, not real time.
-        """
         mem1 = self.lif1.init_leaky()
         mem2 = self.lif2.init_leaky()
         mem3 = self.lif3.init_leaky()
@@ -66,18 +60,6 @@ class AiriaSNN(nn.Module):
         return torch.stack(spk3_rec)
 
     def forward_step(self, x, mem1, mem2, mem3):
-        """
-        Temporal mode: processes ONE paragraph as ONE real timestep.
-        Membrane state is passed in from the frontend and returned updated.
-
-        This is the correct SNN usage. Each paragraph is a real event in
-        time. The membrane accumulates genuine reading struggle across the
-        article. Early struggle primes the membrane so later struggle
-        triggers faster. The frontend holds mem1/mem2/mem3 in JavaScript
-        memory between paragraphs and discards them when the session ends.
-
-        No artificial internal timesteps. One paragraph = one step.
-        """
         cur1 = self.fc1(x)
         spk1, mem1 = self.lif1(cur1, mem1)
         cur2 = self.fc2(spk1)
@@ -127,12 +109,10 @@ def base64_to_weights(b64: str) -> dict:
 
 
 def membrane_to_list(mem: torch.Tensor) -> list:
-    """Serialize membrane tensor to plain list for JSON transport."""
     return mem.detach().tolist()
 
 
 def list_to_membrane(data: list) -> torch.Tensor:
-    """Deserialize membrane state from JSON back to tensor."""
     return torch.tensor(data, dtype=torch.float32)
 
 
@@ -187,11 +167,6 @@ class ParagraphFeatures(BaseModel):
     blur_count: float
 
 class PredictParagraphRequest(BaseModel):
-    """
-    Per-paragraph temporal inference.
-    mem1/mem2/mem3 carry the membrane state from the previous paragraph.
-    Null on the first paragraph of a session — fresh zeros are used.
-    """
     features: ParagraphFeatures
     weights: Optional[str] = None
     mem1: Optional[List[float]] = None
@@ -199,18 +174,13 @@ class PredictParagraphRequest(BaseModel):
     mem3: Optional[List[float]] = None
 
 class PredictParagraphResponse(BaseModel):
-    """
-    Returns spike output plus updated membrane states.
-    Frontend carries mem1/mem2/mem3 into the next paragraph call.
-    membrane_charge is a 0-1 scalar for a live difficulty gauge.
-    """
     spiked: bool
-    spike_class: str            # too_hard / just_right / too_easy
+    spike_class: str
     spike_values: List[float]
     mem1: List[float]
     mem2: List[float]
     mem3: List[float]
-    membrane_charge: float      # how charged the output layer is overall
+    membrane_charge: float
 
 class PredictRequest(BaseModel):
     avg_wpm: float
@@ -254,17 +224,15 @@ class IngestURLResponse(BaseModel):
     article_id: str
     classification: dict = {}
 
-# ── NEW: Intervention models ──────────────────────────────────────────────────
-
 class InterventionRequest(BaseModel):
-    paragraph: str              # the paragraph the user struggled with
-    genre_difficulty: float     # 0.0-1.0 from article classification
+    paragraph: str
+    genre_difficulty: float
     specific_genre: str = "general"
 
 class InterventionResponse(BaseModel):
-    level: int                  # 2 = full rewrite, 3 = surgical annotation
-    rewritten: str              # the altered paragraph shown to the user
-    annotation: str             # one-sentence explanation of what was hard
+    level: int
+    rewritten: str
+    annotation: str
 
 
 # ─────────────────────────────────────────────
@@ -304,6 +272,53 @@ Article excerpt:
 
 
 # ─────────────────────────────────────────────
+# SCRAPING HELPERS
+# ─────────────────────────────────────────────
+
+# Universal boilerplate patterns that apply across all sites.
+# Kept deliberately short — we want to under-filter, not over-filter.
+UNIVERSAL_SKIP = [
+    'subscribe', 'sign up for', 'newsletter', 'share this',
+    'follow us on', 'image:', 'photo credit:', 'advertisement',
+    'all rights reserved', 'terms of service', 'privacy policy',
+]
+
+def clean_paragraphs(raw_text: str) -> list:
+    """
+    Respect trafilatura's paragraph boundaries (\n\n) directly instead
+    of re-splitting on every newline. Only filters universal boilerplate.
+    Min word count is 8 — low enough to keep short but valid sentences.
+    """
+    paragraphs = raw_text.split('\n\n')
+    cleaned = []
+    for para in paragraphs:
+        # Collapse any internal line-wrapping the scraper left behind
+        para = ' '.join(para.split()).strip()
+        if len(para.split()) < 8:
+            continue
+        if any(p in para.lower() for p in UNIVERSAL_SKIP):
+            continue
+        cleaned.append(para)
+    return cleaned
+
+
+def scrape_with_newspaper(url: str) -> tuple:
+    """
+    Fallback scraper using newspaper3k.
+    Only called when trafilatura returns empty content.
+    Returns (title, raw_text) or raises on failure.
+    """
+    from newspaper import Article
+    article = Article(url)
+    article.download()
+    article.parse()
+    if not article.text:
+        raise ValueError("newspaper3k returned empty content")
+    title = article.title or "Untitled Article"
+    return title, article.text
+
+
+# ─────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────
 
@@ -311,7 +326,7 @@ Article excerpt:
 async def root():
     return {
         "status": "AIRIA SNN Backend Running",
-        "version": "3.2",
+        "version": "3.3",
         "storage": "stateless — all user data in browser localStorage",
         "snn_mode": "temporal per-paragraph + end-of-session snapshot"
     }
@@ -324,20 +339,6 @@ async def get_base_weights():
 
 @app.post("/predict-paragraph", response_model=PredictParagraphResponse)
 async def predict_paragraph(data: PredictParagraphRequest):
-    """
-    Temporal inference — called after each paragraph is read.
-
-    The frontend passes this paragraph's 6 features plus the membrane
-    states from the previous paragraph. The SNN runs exactly one real
-    timestep. Updated membrane states are returned for the next call.
-
-    This is the correct SNN usage pattern:
-    - Each paragraph = one real timestep in the network
-    - Membrane accumulates genuine struggle across the article
-    - Early struggle primes the system, later struggle fires faster
-    - No artificial internal simulation steps
-    - Server holds nothing between requests
-    """
     model = load_model_from_b64(data.weights)
     model.eval()
 
@@ -384,11 +385,6 @@ async def predict_paragraph(data: PredictParagraphRequest):
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(data: PredictRequest):
-    """
-    End-of-session snapshot classification.
-    Uses forward_snapshot (25 internal steps) for a stable final prediction.
-    Used for the feedback screen after finishing an article.
-    """
     model = load_model_from_b64(data.weights)
 
     x = torch.tensor([[
@@ -412,12 +408,6 @@ async def predict(data: PredictRequest):
 
 @app.post("/retrain", response_model=RetrainResponse)
 async def retrain(data: RetrainRequest):
-    """
-    Fine-tunes the model on user samples from localStorage.
-    Uses forward_snapshot for training since it gives stable gradients.
-    Returns updated weights — frontend saves to localStorage.
-    Server stores nothing.
-    """
     MIN_SAMPLES = 10
 
     if len(data.samples) < MIN_SAMPLES:
@@ -460,16 +450,6 @@ async def retrain(data: RetrainRequest):
 
 @app.post("/intervene", response_model=InterventionResponse)
 async def intervene(data: InterventionRequest):
-    """
-    Called when the SNN spikes too_hard mid-article.
-
-    Decides intervention level from genre_difficulty:
-      0.5 - 0.7  →  Level 2: full paragraph rewrite in simpler language
-      > 0.7      →  Level 3: surgical annotation of only the hard parts
-
-    Calls Claude, returns the altered text and a one-sentence annotation
-    explaining what made the paragraph hard. Server stores nothing.
-    """
     level = 3 if data.genre_difficulty > 0.7 else 2
 
     if level == 2:
@@ -523,7 +503,6 @@ Respond with ONLY valid JSON, no markdown."""
         )
 
     except Exception as e:
-        # Fallback: return original paragraph unchanged so the UI doesn't break
         print(f"Intervention failed: {e}")
         return InterventionResponse(
             level=level,
@@ -535,61 +514,45 @@ Respond with ONLY valid JSON, no markdown."""
 @app.post("/ingest-url", response_model=IngestURLResponse)
 async def ingest_url(data: IngestURLRequest):
     try:
+        # ── Step 1: Try trafilatura ───────────────────────────────────────────
         downloaded = trafilatura.fetch_url(data.url)
-        if not downloaded:
-            raise ValueError("Failed to download URL")
+        content = None
+        title = "Untitled Article"
 
-        content = trafilatura.extract(
-            downloaded,
-            include_comments=False,
-            include_tables=False,
-            include_images=False,
-            no_fallback=False,
-            favor_precision=True,
-            favor_recall=False,
-            include_formatting=True
-        )
+        if downloaded:
+            content = trafilatura.extract(
+                downloaded,
+                include_comments=False,
+                include_tables=False,
+                include_images=False,
+                no_fallback=False,
+                favor_precision=False,  # loosened from True — recovers more text
+                favor_recall=True,      # flipped from False — pull more through
+                include_formatting=True
+            )
+            metadata = trafilatura.extract_metadata(downloaded)
+            if metadata and metadata.title:
+                title = metadata.title
 
+        # ── Step 2: Fallback to newspaper3k if trafilatura came up empty ──────
         if not content:
-            raise ValueError("Failed to extract content from URL")
+            print(f"trafilatura empty for {data.url}, trying newspaper3k...")
+            try:
+                title, content = scrape_with_newspaper(data.url)
+            except Exception as ne:
+                raise ValueError(f"Both scrapers failed — trafilatura: empty, newspaper3k: {ne}")
 
-        metadata = trafilatura.extract_metadata(downloaded)
-        title = metadata.title if metadata and metadata.title else "Untitled Article"
+        # ── Step 3: Clean using trafilatura's own paragraph boundaries ────────
+        cleaned_paragraphs = clean_paragraphs(content)
 
-        lines = content.split('\n')
-        cleaned_paragraphs = []
-        skip_patterns = [
-            'join war on the rocks', 'subscribe', 'follow', 'share this',
-            'image:', 'photo:', 'credit:', 'related articles',
-            'recommended reading', 'follow him on twitter', 'follow her on twitter',
-            'airman', 'staff sgt', 'tech sgt'
-        ]
-        current_paragraph = []
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                if current_paragraph:
-                    para_text = ' '.join(current_paragraph)
-                    if len(para_text.split()) >= 20:
-                        if not any(p in para_text.lower() for p in skip_patterns):
-                            cleaned_paragraphs.append(para_text)
-                    current_paragraph = []
-                continue
-            if len(line.split()) < 5:
-                continue
-            current_paragraph.append(line)
-
-        if current_paragraph:
-            para_text = ' '.join(current_paragraph)
-            if len(para_text.split()) >= 20:
-                if not any(p in para_text.lower() for p in skip_patterns):
-                    cleaned_paragraphs.append(para_text)
+        if not cleaned_paragraphs:
+            raise ValueError("Content extracted but all paragraphs were filtered out")
 
         clean_content = '\n\n'.join(cleaned_paragraphs)
         word_count = len(clean_content.split())
         paragraph_count = len(cleaned_paragraphs)
 
+        # ── Step 4: Lexile estimate + Claude classification ───────────────────
         fk_grade = textstat.flesch_kincaid_grade(clean_content)
         estimated_lexile = max(200, min(1600, int(fk_grade * 100 + 200)))
 

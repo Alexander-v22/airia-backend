@@ -5,3 +5,4 @@ numpy
 trafilatura
 textstat
 anthropic
+newspaper3k
