@@ -71,37 +71,59 @@ class AiriaSNN(nn.Module):
 
 # ─────────────────────────────────────────────
 # BASE TRAINING DATA
+#
+# Feature order: [avg_wpm, wpm_variance, back_presses, completion_rate, slowdown_ratio, blur_count]
+#
+# Normalization:
+#   avg_wpm        = raw_wpm / 500
+#   wpm_variance   = std_dev / 200
+#   back_presses   = count / 10
+#   completion_rate = fraction 0-1
+#   slowdown_ratio = avg_wpm / this_para_wpm, clamped 0-1
+#                    (1.0 = this paragraph was much slower than average = struggle)
+#   blur_count     = tab_aways / 5
+#
+# Label mapping (must match spike_classes in predict_paragraph):
+#   0 = too_hard
+#   1 = just_right
+#   2 = too_easy
 # ─────────────────────────────────────────────
 
 X_train = torch.tensor([
-    # ── too_hard (label 0) ───────────────────────────────────────────────────
-    [0.36,    0.55,  0.60,  0.45,  1.00,  0.40],
-    [0.40,    0.60,  0.50,  0.50,  1.00,  0.50],
-    [0.32,    0.65,  0.70,  0.40,  1.00,  0.60],
-    [0.38,    0.50,  0.40,  0.55,  0.95,  0.30],
-    [0.34,    0.70,  0.80,  0.35,  1.00,  0.70],
-    [0.42,    0.45,  0.30,  0.60,  0.90,  0.20],
+    # ── too_hard (label 0): slow absolute WPM, high slowdown, high variance ──
+    [0.36,    0.55,  0.60,  0.45,  1.00,  0.40],  # 180 WPM, big slowdown
+    [0.40,    0.60,  0.50,  0.50,  1.00,  0.50],  # 200 WPM, high variance
+    [0.32,    0.65,  0.70,  0.40,  1.00,  0.60],  # 160 WPM, lots of back presses
+    [0.38,    0.50,  0.40,  0.55,  0.95,  0.30],  # 190 WPM, moderate struggle
+    [0.34,    0.70,  0.80,  0.35,  1.00,  0.70],  # 170 WPM, high distraction
+    [0.42,    0.45,  0.30,  0.60,  0.90,  0.20],  # 210 WPM, mild struggle
 
-    # ── just_right (label 1) ─────────────────────────────────────────────────
-    [0.58,    0.15,  0.10,  0.85,  0.65,  0.05],
-    [0.54,    0.20,  0.20,  0.80,  0.70,  0.10],
-    [0.62,    0.18,  0.10,  0.90,  0.60,  0.05],
-    [0.56,    0.22,  0.10,  0.85,  0.68,  0.08],
-    [0.60,    0.16,  0.20,  0.88,  0.62,  0.06],
-    [0.52,    0.25,  0.30,  0.75,  0.75,  0.12],
+    # ── just_right (label 1): mid WPM, low variance, minimal friction ────────
+    [0.58,    0.15,  0.10,  0.85,  0.65,  0.05],  # 290 WPM, comfortable
+    [0.54,    0.20,  0.20,  0.80,  0.70,  0.10],  # 270 WPM, slight variance
+    [0.62,    0.18,  0.10,  0.90,  0.60,  0.05],  # 310 WPM, smooth
+    [0.56,    0.22,  0.10,  0.85,  0.68,  0.08],  # 280 WPM, normal
+    [0.60,    0.16,  0.20,  0.88,  0.62,  0.06],  # 300 WPM, low distraction
+    [0.52,    0.25,  0.30,  0.75,  0.75,  0.12],  # 260 WPM, few back presses
 
-    # ── too_easy (label 2) ───────────────────────────────────────────────────
-    [0.80,    0.05,  0.00,  1.00,  0.30,  0.00],
-    [0.86,    0.04,  0.00,  1.00,  0.25,  0.00],
-    [0.76,    0.06,  0.00,  1.00,  0.35,  0.00],
-    [0.90,    0.03,  0.00,  1.00,  0.20,  0.00],
-    [0.78,    0.07,  0.00,  0.98,  0.32,  0.00],
-    [0.82,    0.05,  0.00,  1.00,  0.28,  0.00],
+    # ── too_easy (label 2): fast WPM, near-zero variance, no friction ────────
+    [0.80,    0.05,  0.00,  1.00,  0.30,  0.00],  # 400 WPM, skimming
+    [0.86,    0.04,  0.00,  1.00,  0.25,  0.00],  # 430 WPM, very fast
+    [0.76,    0.06,  0.00,  1.00,  0.35,  0.00],  # 380 WPM, breezing
+    [0.90,    0.03,  0.00,  1.00,  0.20,  0.00],  # 450 WPM, near max
+    [0.78,    0.07,  0.00,  0.98,  0.32,  0.00],  # 390 WPM
+    [0.82,    0.05,  0.00,  1.00,  0.28,  0.00],  # 410 WPM, zero friction
 ], dtype=torch.float32)
 
-y_train = torch.tensor([0, 0, 0, 0, 0, 0,
-                         1, 1, 1, 1, 1, 1,
-                         2, 2, 2, 2, 2, 2])
+# Labels explicitly named for clarity — 0=too_hard, 1=just_right, 2=too_easy
+y_train = torch.tensor([
+    0, 0, 0, 0, 0, 0,   # too_hard
+    1, 1, 1, 1, 1, 1,   # just_right
+    2, 2, 2, 2, 2, 2,   # too_easy
+])
+
+# spike_classes list in predict_paragraph must match this order exactly
+SPIKE_CLASSES = ["too_hard", "just_right", "too_easy"]
 
 
 # ─────────────────────────────────────────────
@@ -120,14 +142,12 @@ def base64_to_weights(b64: str) -> dict:
 
 
 def membrane_to_list(mem: torch.Tensor) -> list:
-    # Flatten to 1D before serializing so Pydantic gets List[float], not List[List[float]].
-    # Membrane tensors from snntorch are shape [1, N] (batch dim kept),
-    # flatten() collapses to [N] which serializes cleanly.
+    # Flatten [1, N] → [N] before serializing so Pydantic gets List[float]
     return mem.detach().flatten().tolist()
 
 
 def list_to_membrane(data: list) -> torch.Tensor:
-    # Restore the [1, N] batch dimension that snntorch expects.
+    # Restore [1, N] batch dim that snntorch expects
     return torch.tensor(data, dtype=torch.float32).unsqueeze(0)
 
 
@@ -344,7 +364,7 @@ def scrape_with_newspaper(url: str) -> tuple:
 async def root():
     return {
         "status": "AIRIA SNN Backend Running",
-        "version": "3.6",
+        "version": "3.7",
         "storage": "stateless — all user data in browser localStorage",
         "snn_mode": "temporal per-paragraph + end-of-session snapshot"
     }
@@ -380,9 +400,9 @@ async def predict_paragraph(data: PredictParagraphRequest):
     if isinstance(spike_values, float):
         spike_values = [spike_values, 0.0, 0.0]
 
+    # Index 0 = too_hard, 1 = just_right, 2 = too_easy — must match y_train labels
     spiked = any(v > 0.5 for v in spike_values)
     spike_class_idx = int(torch.tensor(spike_values).argmax().item())
-    spike_classes = ["too_hard", "just_right", "too_easy"]
 
     mem3_flat = mem3.squeeze()
     if mem3_flat.dim() == 0:
@@ -392,7 +412,7 @@ async def predict_paragraph(data: PredictParagraphRequest):
 
     return PredictParagraphResponse(
         spiked=spiked,
-        spike_class=spike_classes[spike_class_idx],
+        spike_class=SPIKE_CLASSES[spike_class_idx],
         spike_values=spike_values,
         mem1=membrane_to_list(mem1),
         mem2=membrane_to_list(mem2),
@@ -416,9 +436,8 @@ async def predict(data: PredictRequest):
         spike_counts = spk_out.sum(dim=0).squeeze()
         prediction = spike_counts.argmax().item()
 
-    actions = ["too_hard", "just_right", "too_easy"]
     return PredictionResponse(
-        action=actions[prediction],
+        action=SPIKE_CLASSES[prediction],
         confidence=float(spike_counts.max()),
         raw_scores=spike_counts.tolist()
     )
