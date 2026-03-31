@@ -551,9 +551,24 @@ Respond with ONLY valid JSON, no markdown."""
 
 @app.post("/annotate", response_model=AnnotateResponse)
 async def annotate(data: AnnotateRequest):
+    difficulty_instruction = (
+        "Include conceptual explanations, not just terms. Prioritize clarity over brevity."
+        if data.genre_difficulty > 0.7 else
+        "Only annotate uncommon or specialized terms — skip anything a general reader would know."
+    )
+
     prompt = f"""Analyze this paragraph from a {data.specific_genre} article (difficulty: {data.genre_difficulty:.2f}/1.0).
 
-Identify domain-specific terms a general reader is unlikely to know. Provide a plain-language definition (one sentence, under 20 words) for each. Only flag genuinely specialized terms — skip common words and general academic vocabulary. Return 0 to 6 terms with exact character positions (zero-based start and end index).
+Your goal is to identify what a general reader would struggle to understand in this specific paragraph. Focus on three types of annotation targets:
+1. Domain-specific terms (technical vocabulary)
+2. Article-specific references (events, policies, organizations, people mentioned without explanation)
+3. Implicit concepts the paragraph assumes the reader already knows
+
+For each item provide a plain-language definition — one sentence, under 20 words. Only include items that genuinely block comprehension. Avoid obvious words and general academic vocabulary. Return 0 to 6 total annotations, prioritizing the most important blockers.
+
+{difficulty_instruction}
+
+For each annotation, include the exact character position in the original paragraph text (zero-based start and end index).
 
 Paragraph:
 {data.paragraph}
@@ -562,7 +577,7 @@ Respond with ONLY valid JSON:
 {{"terms": [{{"term": "...", "definition": "...", "start": 0, "end": 0}}]}}"""
 
     try:
-        message = claude_client.messages.create(model="claude-sonnet-4-20250514", max_tokens=768, messages=[{"role": "user", "content": prompt}])
+        message = claude_client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1024, messages=[{"role": "user", "content": prompt}])
         result  = json.loads(message.content[0].text.strip())
 
         para_len = len(data.paragraph)
