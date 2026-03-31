@@ -69,28 +69,58 @@ class AiriaSNN(nn.Module):
         return spk3, mem1, mem2, mem3
 
 
-# Base training data
+# ─────────────────────────────────────────────
+# BASE TRAINING DATA
+#
+# Feature order: [avg_wpm, wpm_variance, back_presses, completion_rate, slowdown_ratio, blur_count]
+#
+# Normalization:
+#   avg_wpm        = raw_wpm / 500         (500 WPM ceiling)
+#   wpm_variance   = std_dev / 200         (200 WPM std dev ceiling)
+#   back_presses   = count / 10            (10 press ceiling)
+#   completion_rate = fraction 0-1
+#   slowdown_ratio = avg_wpm / this_para_wpm, clamped 0-1
+#                    (1.0 = this paragraph was much slower than average = struggle)
+#   blur_count     = tab_aways / 5         (5 tab-away ceiling)
+#
+# Realistic reading speed assumptions:
+#   Comfortable reading:   250-350 WPM  -> normalized 0.50-0.70
+#   Struggling paragraph:  150-220 WPM  -> normalized 0.30-0.44
+#   Easy/skimming:         380-450 WPM  -> normalized 0.76-0.90
+# ─────────────────────────────────────────────
+
 X_train = torch.tensor([
-    [0.2, 0.8, 0.7, 0.6, 0.3, 0.6],
-    [0.25, 0.7, 0.6, 0.7, 0.4, 0.5],
-    [0.15, 0.9, 0.8, 0.5, 0.2, 0.7],
-    [0.3, 0.6, 0.5, 0.8, 0.35, 0.4],
-    [0.18, 0.85, 0.7, 0.55, 0.25, 0.65],
-    [0.22, 0.75, 0.65, 0.65, 0.3, 0.55],
-    [0.5, 0.3, 0.2, 0.95, 0.7, 0.1],
-    [0.55, 0.25, 0.15, 1.0, 0.75, 0.05],
-    [0.45, 0.35, 0.25, 0.9, 0.65, 0.15],
-    [0.5, 0.3, 0.1, 1.0, 0.7, 0.1],
-    [0.48, 0.32, 0.2, 0.95, 0.68, 0.12],
-    [0.52, 0.28, 0.18, 1.0, 0.72, 0.08],
-    [0.8, 0.15, 0.05, 1.0, 0.85, 0.0],
-    [0.85, 0.1, 0.0, 1.0, 0.9, 0.0],
-    [0.75, 0.2, 0.1, 1.0, 0.8, 0.05],
-    [0.9, 0.1, 0.0, 1.0, 0.92, 0.0],
-    [0.78, 0.18, 0.08, 1.0, 0.82, 0.02],
-    [0.82, 0.12, 0.05, 1.0, 0.88, 0.0],
+    # ── too_hard (label 0) ───────────────────────────────────────────────────
+    # avg_wpm  var    back   comp   slow   blur
+    [0.36,    0.55,  0.60,  0.45,  1.00,  0.40],  # 180 WPM, big slowdown, went back
+    [0.40,    0.60,  0.50,  0.50,  1.00,  0.50],  # 200 WPM, high variance
+    [0.32,    0.65,  0.70,  0.40,  1.00,  0.60],  # 160 WPM, lots of back presses
+    [0.38,    0.50,  0.40,  0.55,  0.95,  0.30],  # 190 WPM, moderate struggle
+    [0.34,    0.70,  0.80,  0.35,  1.00,  0.70],  # 170 WPM, high distraction
+    [0.42,    0.45,  0.30,  0.60,  0.90,  0.20],  # 210 WPM, mild-moderate struggle
+
+    # ── just_right (label 1) ─────────────────────────────────────────────────
+    # avg_wpm  var    back   comp   slow   blur
+    [0.58,    0.15,  0.10,  0.85,  0.65,  0.05],  # 290 WPM, comfortable
+    [0.54,    0.20,  0.20,  0.80,  0.70,  0.10],  # 270 WPM, slight variance
+    [0.62,    0.18,  0.10,  0.90,  0.60,  0.05],  # 310 WPM, smooth reading
+    [0.56,    0.22,  0.10,  0.85,  0.68,  0.08],  # 280 WPM, normal session
+    [0.60,    0.16,  0.20,  0.88,  0.62,  0.06],  # 300 WPM, low distraction
+    [0.52,    0.25,  0.30,  0.75,  0.75,  0.12],  # 260 WPM, few back presses
+
+    # ── too_easy (label 2) ───────────────────────────────────────────────────
+    # avg_wpm  var    back   comp   slow   blur
+    [0.80,    0.05,  0.00,  1.00,  0.30,  0.00],  # 400 WPM, skimming
+    [0.86,    0.04,  0.00,  1.00,  0.25,  0.00],  # 430 WPM, very fast
+    [0.76,    0.06,  0.00,  1.00,  0.35,  0.00],  # 380 WPM, breezing through
+    [0.90,    0.03,  0.00,  1.00,  0.20,  0.00],  # 450 WPM, near max speed
+    [0.78,    0.07,  0.00,  0.98,  0.32,  0.00],  # 390 WPM, almost full completion
+    [0.82,    0.05,  0.00,  1.00,  0.28,  0.00],  # 410 WPM, zero friction
 ], dtype=torch.float32)
-y_train = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2])
+
+y_train = torch.tensor([0, 0, 0, 0, 0, 0,
+                         1, 1, 1, 1, 1, 1,
+                         2, 2, 2, 2, 2, 2])
 
 
 # ─────────────────────────────────────────────
@@ -224,31 +254,23 @@ class IngestURLResponse(BaseModel):
     article_id: str
     classification: dict = {}
 
-# ─────────────────────────────────────────────
-# INTERVENTION MODELS
-# ─────────────────────────────────────────────
-
 class InterventionRequest(BaseModel):
     paragraph: str
     genre_difficulty: float
     specific_genre: str = "general"
 
 class InterventionResponse(BaseModel):
-    level: int                  # 2 = moderate rewrite, 3 = aggressive rewrite
-    rewrite_strength: str       # "moderate" or "aggressive"
-    primer: str                 # background knowledge card shown first
-    rewritten: str              # rewrite shown only if user still struggles
-    annotation: str             # one sentence on what made it hard
-
-# ─────────────────────────────────────────────
-# ANNOTATION MODELS
-# ─────────────────────────────────────────────
+    level: int
+    rewrite_strength: str
+    primer: str
+    rewritten: str
+    annotation: str
 
 class AnnotationTerm(BaseModel):
     term: str
     definition: str
-    start: int                  # character offset in original paragraph
-    end: int                    # character offset in original paragraph
+    start: int
+    end: int
 
 class AnnotateRequest(BaseModel):
     paragraph: str
@@ -337,7 +359,7 @@ def scrape_with_newspaper(url: str) -> tuple:
 async def root():
     return {
         "status": "AIRIA SNN Backend Running",
-        "version": "3.4",
+        "version": "3.5",
         "storage": "stateless — all user data in browser localStorage",
         "snn_mode": "temporal per-paragraph + end-of-session snapshot"
     }
@@ -461,47 +483,24 @@ async def retrain(data: RetrainRequest):
 
 @app.post("/intervene", response_model=InterventionResponse)
 async def intervene(data: InterventionRequest):
-    """
-    Called when the SNN spikes too_hard mid-article.
-
-    Both levels show a primer first. The primer is identical across levels —
-    it gives the user the background knowledge the paragraph assumes.
-    If the primer is not enough, the rewrite is available as a fallback.
-
-    The only thing that changes between levels is rewrite strength:
-      Level 2 (0.5 - 0.7): moderate rewrite — simpler vocabulary and
-        shorter sentences, original structure preserved.
-      Level 3 (> 0.7): aggressive rewrite — paragraph fully reconstructed
-        for maximum clarity, structure not preserved.
-
-    Server stores nothing.
-    """
     level = 3 if data.genre_difficulty > 0.7 else 2
     rewrite_strength = "aggressive" if level == 3 else "moderate"
 
-    # ── Primer prompt — identical across both levels ──────────────────────────
-    # The primer gives the user the background knowledge the paragraph assumes.
-    # It is shown first, before the rewrite, so the user can try the original again.
     primer_prompt = f"""You are a reading assistant. A user is struggling with a paragraph from a {data.specific_genre} article.
 
-Your job is to write a short background knowledge card — 2 to 4 sentences — that gives the reader just enough context to understand the paragraph. Do not summarize the paragraph. Instead, explain the underlying concept or domain knowledge it assumes the reader already has.
-
-Think of it as answering: "What would someone need to already know to understand this paragraph?"
+Write a short background knowledge card — 2 to 4 sentences — that gives the reader just enough context to understand the paragraph. Do not summarize the paragraph. Explain the underlying concept or domain knowledge it assumes the reader already has.
 
 Original paragraph:
 {data.paragraph}
 
 Respond with a JSON object with exactly two fields:
 1. "primer": the background knowledge card as a plain string (2-4 sentences, no jargon, plain language)
-2. "annotation": one sentence identifying the primary knowledge gap (e.g. "This paragraph assumes familiarity with how central banks use interest rates to control inflation.")
+2. "annotation": one sentence identifying the primary knowledge gap
 
 Respond with ONLY valid JSON, no markdown."""
 
-    # ── Rewrite prompt — branches on level for strength ───────────────────────
     if level == 2:
-        rewrite_prompt = f"""You are a reading assistant helping someone who is struggling with a paragraph from a {data.specific_genre} article.
-
-Rewrite the following paragraph at a moderate simplification level. Preserve the original structure and paragraph flow. Use simpler vocabulary and break up long sentences, but keep the same organization and order of ideas. Do not add new information or remove key facts.
+        rewrite_prompt = f"""Rewrite the following paragraph from a {data.specific_genre} article at a moderate simplification level. Preserve the original structure. Use simpler vocabulary and break up long sentences. Do not add new information or remove key facts.
 
 Original paragraph:
 {data.paragraph}
@@ -511,9 +510,7 @@ Respond with a JSON object with exactly one field:
 
 Respond with ONLY valid JSON, no markdown."""
     else:
-        rewrite_prompt = f"""You are a reading assistant helping someone who is struggling with a dense paragraph from a {data.specific_genre} article.
-
-Rewrite the following paragraph at an aggressive simplification level. Do not preserve the original structure — reconstruct it entirely for maximum clarity. Write at roughly an 8th grade reading level. Prioritize comprehension over preserving the original voice or organization. Keep all key facts but present them as simply as possible.
+        rewrite_prompt = f"""Rewrite the following paragraph from a {data.specific_genre} article at an aggressive simplification level. Reconstruct it entirely for maximum clarity at roughly an 8th grade reading level. Do not preserve original structure. Keep all key facts.
 
 Original paragraph:
 {data.paragraph}
@@ -524,23 +521,11 @@ Respond with a JSON object with exactly one field:
 Respond with ONLY valid JSON, no markdown."""
 
     try:
-        # Run both Claude calls concurrently would be ideal but keeping sequential
-        # for simplicity — primer is shown first anyway so rewrite can lazy-load
-        primer_msg = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=512,
-            messages=[{"role": "user", "content": primer_prompt}]
-        )
-        primer_raw    = primer_msg.content[0].text.strip()
-        primer_result = json.loads(primer_raw)
+        primer_msg    = claude_client.messages.create(model="claude-sonnet-4-20250514", max_tokens=512, messages=[{"role": "user", "content": primer_prompt}])
+        primer_result = json.loads(primer_msg.content[0].text.strip())
 
-        rewrite_msg = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": rewrite_prompt}]
-        )
-        rewrite_raw    = rewrite_msg.content[0].text.strip()
-        rewrite_result = json.loads(rewrite_raw)
+        rewrite_msg    = claude_client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1024, messages=[{"role": "user", "content": rewrite_prompt}])
+        rewrite_result = json.loads(rewrite_msg.content[0].text.strip())
 
         return InterventionResponse(
             level=level,
@@ -549,7 +534,6 @@ Respond with ONLY valid JSON, no markdown."""
             rewritten=rewrite_result["rewritten"],
             annotation=primer_result.get("annotation", "")
         )
-
     except Exception as e:
         print(f"Intervention failed: {e}")
         return InterventionResponse(
@@ -563,72 +547,33 @@ Respond with ONLY valid JSON, no markdown."""
 
 @app.post("/annotate", response_model=AnnotateResponse)
 async def annotate(data: AnnotateRequest):
-    """
-    Annotation mode — user-initiated, runs independently of the SNN.
+    prompt = f"""Analyze this paragraph from a {data.specific_genre} article (difficulty: {data.genre_difficulty:.2f}/1.0).
 
-    Called after a paragraph is completed when the user has annotation
-    mode toggled on. Claude identifies domain-specific terms and returns
-    them with definitions and character offsets so the frontend can wrap
-    the exact terms in highlight spans without modifying the paragraph text.
+Identify domain-specific terms a general reader is unlikely to know. Provide a plain-language definition (one sentence, under 20 words) for each. Only flag genuinely specialized terms — skip common words and general academic vocabulary. Return 0 to 6 terms with exact character positions (zero-based start and end index).
 
-    Only flags genuinely domain-specific terms. Common words, general
-    academic vocabulary, and terms a general reader would know are skipped.
-
-    Server stores nothing — the frontend logs annotation events to
-    airia_annotation_log in localStorage for stats and personalization.
-    """
-    prompt = f"""You are a reading assistant analyzing a paragraph from a {data.specific_genre} article (difficulty: {data.genre_difficulty:.2f} out of 1.0).
-
-Identify domain-specific terms in the paragraph that a general reader is unlikely to know. For each term, provide a short plain-language definition (one sentence, under 20 words).
-
-Rules:
-- Only flag genuinely specialized terms. Skip common words, general academic vocabulary, and anything a curious non-expert would already know.
-- Return between 0 and 6 terms. If there are no genuinely hard terms, return an empty list.
-- For each term, include the exact character position where it appears in the original paragraph (start and end index, zero-based).
-
-Original paragraph:
+Paragraph:
 {data.paragraph}
 
-Respond with a JSON object with exactly one field:
-1. "terms": an array of objects, each with "term" (string), "definition" (string), "start" (int), "end" (int)
-
-Example:
-{{"terms": [{{"term": "yield curve inversion", "definition": "When short-term bonds pay more interest than long-term ones, often signaling a coming recession.", "start": 45, "end": 66}}]}}
-
-Respond with ONLY valid JSON, no markdown."""
+Respond with ONLY valid JSON:
+{{"terms": [{{"term": "...", "definition": "...", "start": 0, "end": 0}}]}}"""
 
     try:
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=768,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw    = message.content[0].text.strip()
-        result = json.loads(raw)
+        message = claude_client.messages.create(model="claude-sonnet-4-20250514", max_tokens=768, messages=[{"role": "user", "content": prompt}])
+        result  = json.loads(message.content[0].text.strip())
 
-        # Validate and clamp offsets against the actual paragraph length
         para_len = len(data.paragraph)
         terms = []
         for t in result.get("terms", []):
             start = max(0, min(int(t["start"]), para_len))
             end   = max(start, min(int(t["end"]), para_len))
-            # Skip if the extracted term doesn't match the paragraph at those offsets
             if data.paragraph[start:end].lower() != t["term"].lower():
-                # Try a simple search fallback before discarding
                 idx = data.paragraph.lower().find(t["term"].lower())
                 if idx == -1:
                     continue
-                start = idx
-                end   = idx + len(t["term"])
-            terms.append(AnnotationTerm(
-                term=t["term"],
-                definition=t["definition"],
-                start=start,
-                end=end
-            ))
+                start, end = idx, idx + len(t["term"])
+            terms.append(AnnotationTerm(term=t["term"], definition=t["definition"], start=start, end=end))
 
         return AnnotateResponse(terms=terms)
-
     except Exception as e:
         print(f"Annotation failed: {e}")
         return AnnotateResponse(terms=[])
@@ -639,19 +584,10 @@ async def ingest_url(data: IngestURLRequest):
     try:
         downloaded = trafilatura.fetch_url(data.url)
         content = None
-        title = "Untitled Article"
+        title   = "Untitled Article"
 
         if downloaded:
-            content = trafilatura.extract(
-                downloaded,
-                include_comments=False,
-                include_tables=False,
-                include_images=False,
-                no_fallback=False,
-                favor_precision=False,
-                favor_recall=True,
-                include_formatting=True
-            )
+            content  = trafilatura.extract(downloaded, include_comments=False, include_tables=False, include_images=False, no_fallback=False, favor_precision=False, favor_recall=True, include_formatting=True)
             metadata = trafilatura.extract_metadata(downloaded)
             if metadata and metadata.title:
                 title = metadata.title
@@ -664,15 +600,13 @@ async def ingest_url(data: IngestURLRequest):
                 raise ValueError(f"Both scrapers failed — trafilatura: empty, newspaper3k: {ne}")
 
         cleaned_paragraphs = clean_paragraphs(content)
-
         if not cleaned_paragraphs:
             raise ValueError("Content extracted but all paragraphs were filtered out")
 
-        clean_content   = '\n\n'.join(cleaned_paragraphs)
-        word_count      = len(clean_content.split())
-        paragraph_count = len(cleaned_paragraphs)
-
-        fk_grade        = textstat.flesch_kincaid_grade(clean_content)
+        clean_content    = '\n\n'.join(cleaned_paragraphs)
+        word_count       = len(clean_content.split())
+        paragraph_count  = len(cleaned_paragraphs)
+        fk_grade         = textstat.flesch_kincaid_grade(clean_content)
         estimated_lexile = max(200, min(1600, int(fk_grade * 100 + 200)))
 
         classification = {}
@@ -680,30 +614,14 @@ async def ingest_url(data: IngestURLRequest):
             classification = classify_text_with_claude(clean_content)
         except Exception as ce:
             print(f"Classification failed: {ce}")
-            classification = {
-                "broad_genre": "other", "specific_genre": "unknown",
-                "genre_difficulty": 0.5, "reasoning": "Classification unavailable"
-            }
+            classification = {"broad_genre": "other", "specific_genre": "unknown", "genre_difficulty": 0.5, "reasoning": "Classification unavailable"}
 
         article_id = f"article_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
-        return IngestURLResponse(
-            status="success",
-            title=title,
-            content=clean_content,
-            estimated_lexile=estimated_lexile,
-            word_count=word_count,
-            paragraph_count=paragraph_count,
-            article_id=article_id,
-            classification=classification
-        )
+        return IngestURLResponse(status="success", title=title, content=clean_content, estimated_lexile=estimated_lexile, word_count=word_count, paragraph_count=paragraph_count, article_id=article_id, classification=classification)
 
     except Exception as e:
-        return IngestURLResponse(
-            status="error", title="Error", content=str(e),
-            estimated_lexile=0, word_count=0, paragraph_count=0,
-            article_id="", classification={}
-        )
+        return IngestURLResponse(status="error", title="Error", content=str(e), estimated_lexile=0, word_count=0, paragraph_count=0, article_id="", classification={})
 
 
 if __name__ == "__main__":
