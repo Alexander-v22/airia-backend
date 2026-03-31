@@ -71,51 +71,32 @@ class AiriaSNN(nn.Module):
 
 # ─────────────────────────────────────────────
 # BASE TRAINING DATA
-#
-# Feature order: [avg_wpm, wpm_variance, back_presses, completion_rate, slowdown_ratio, blur_count]
-#
-# Normalization:
-#   avg_wpm        = raw_wpm / 500         (500 WPM ceiling)
-#   wpm_variance   = std_dev / 200         (200 WPM std dev ceiling)
-#   back_presses   = count / 10            (10 press ceiling)
-#   completion_rate = fraction 0-1
-#   slowdown_ratio = avg_wpm / this_para_wpm, clamped 0-1
-#                    (1.0 = this paragraph was much slower than average = struggle)
-#   blur_count     = tab_aways / 5         (5 tab-away ceiling)
-#
-# Realistic reading speed assumptions:
-#   Comfortable reading:   250-350 WPM  -> normalized 0.50-0.70
-#   Struggling paragraph:  150-220 WPM  -> normalized 0.30-0.44
-#   Easy/skimming:         380-450 WPM  -> normalized 0.76-0.90
 # ─────────────────────────────────────────────
 
 X_train = torch.tensor([
     # ── too_hard (label 0) ───────────────────────────────────────────────────
-    # avg_wpm  var    back   comp   slow   blur
-    [0.36,    0.55,  0.60,  0.45,  1.00,  0.40],  # 180 WPM, big slowdown, went back
-    [0.40,    0.60,  0.50,  0.50,  1.00,  0.50],  # 200 WPM, high variance
-    [0.32,    0.65,  0.70,  0.40,  1.00,  0.60],  # 160 WPM, lots of back presses
-    [0.38,    0.50,  0.40,  0.55,  0.95,  0.30],  # 190 WPM, moderate struggle
-    [0.34,    0.70,  0.80,  0.35,  1.00,  0.70],  # 170 WPM, high distraction
-    [0.42,    0.45,  0.30,  0.60,  0.90,  0.20],  # 210 WPM, mild-moderate struggle
+    [0.36,    0.55,  0.60,  0.45,  1.00,  0.40],
+    [0.40,    0.60,  0.50,  0.50,  1.00,  0.50],
+    [0.32,    0.65,  0.70,  0.40,  1.00,  0.60],
+    [0.38,    0.50,  0.40,  0.55,  0.95,  0.30],
+    [0.34,    0.70,  0.80,  0.35,  1.00,  0.70],
+    [0.42,    0.45,  0.30,  0.60,  0.90,  0.20],
 
     # ── just_right (label 1) ─────────────────────────────────────────────────
-    # avg_wpm  var    back   comp   slow   blur
-    [0.58,    0.15,  0.10,  0.85,  0.65,  0.05],  # 290 WPM, comfortable
-    [0.54,    0.20,  0.20,  0.80,  0.70,  0.10],  # 270 WPM, slight variance
-    [0.62,    0.18,  0.10,  0.90,  0.60,  0.05],  # 310 WPM, smooth reading
-    [0.56,    0.22,  0.10,  0.85,  0.68,  0.08],  # 280 WPM, normal session
-    [0.60,    0.16,  0.20,  0.88,  0.62,  0.06],  # 300 WPM, low distraction
-    [0.52,    0.25,  0.30,  0.75,  0.75,  0.12],  # 260 WPM, few back presses
+    [0.58,    0.15,  0.10,  0.85,  0.65,  0.05],
+    [0.54,    0.20,  0.20,  0.80,  0.70,  0.10],
+    [0.62,    0.18,  0.10,  0.90,  0.60,  0.05],
+    [0.56,    0.22,  0.10,  0.85,  0.68,  0.08],
+    [0.60,    0.16,  0.20,  0.88,  0.62,  0.06],
+    [0.52,    0.25,  0.30,  0.75,  0.75,  0.12],
 
     # ── too_easy (label 2) ───────────────────────────────────────────────────
-    # avg_wpm  var    back   comp   slow   blur
-    [0.80,    0.05,  0.00,  1.00,  0.30,  0.00],  # 400 WPM, skimming
-    [0.86,    0.04,  0.00,  1.00,  0.25,  0.00],  # 430 WPM, very fast
-    [0.76,    0.06,  0.00,  1.00,  0.35,  0.00],  # 380 WPM, breezing through
-    [0.90,    0.03,  0.00,  1.00,  0.20,  0.00],  # 450 WPM, near max speed
-    [0.78,    0.07,  0.00,  0.98,  0.32,  0.00],  # 390 WPM, almost full completion
-    [0.82,    0.05,  0.00,  1.00,  0.28,  0.00],  # 410 WPM, zero friction
+    [0.80,    0.05,  0.00,  1.00,  0.30,  0.00],
+    [0.86,    0.04,  0.00,  1.00,  0.25,  0.00],
+    [0.76,    0.06,  0.00,  1.00,  0.35,  0.00],
+    [0.90,    0.03,  0.00,  1.00,  0.20,  0.00],
+    [0.78,    0.07,  0.00,  0.98,  0.32,  0.00],
+    [0.82,    0.05,  0.00,  1.00,  0.28,  0.00],
 ], dtype=torch.float32)
 
 y_train = torch.tensor([0, 0, 0, 0, 0, 0,
@@ -139,11 +120,15 @@ def base64_to_weights(b64: str) -> dict:
 
 
 def membrane_to_list(mem: torch.Tensor) -> list:
-    return mem.detach().tolist()
+    # Flatten to 1D before serializing so Pydantic gets List[float], not List[List[float]].
+    # Membrane tensors from snntorch are shape [1, N] (batch dim kept),
+    # flatten() collapses to [N] which serializes cleanly.
+    return mem.detach().flatten().tolist()
 
 
 def list_to_membrane(data: list) -> torch.Tensor:
-    return torch.tensor(data, dtype=torch.float32)
+    # Restore the [1, N] batch dimension that snntorch expects.
+    return torch.tensor(data, dtype=torch.float32).unsqueeze(0)
 
 
 def fresh_model() -> AiriaSNN:
@@ -359,7 +344,7 @@ def scrape_with_newspaper(url: str) -> tuple:
 async def root():
     return {
         "status": "AIRIA SNN Backend Running",
-        "version": "3.5",
+        "version": "3.6",
         "storage": "stateless — all user data in browser localStorage",
         "snn_mode": "temporal per-paragraph + end-of-session snapshot"
     }
