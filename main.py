@@ -224,15 +224,39 @@ class IngestURLResponse(BaseModel):
     article_id: str
     classification: dict = {}
 
+# ─────────────────────────────────────────────
+# INTERVENTION MODELS
+# ─────────────────────────────────────────────
+
 class InterventionRequest(BaseModel):
     paragraph: str
     genre_difficulty: float
     specific_genre: str = "general"
 
 class InterventionResponse(BaseModel):
-    level: int
-    rewritten: str
-    annotation: str
+    level: int                  # 2 = moderate rewrite, 3 = aggressive rewrite
+    rewrite_strength: str       # "moderate" or "aggressive"
+    primer: str                 # background knowledge card shown first
+    rewritten: str              # rewrite shown only if user still struggles
+    annotation: str             # one sentence on what made it hard
+
+# ─────────────────────────────────────────────
+# ANNOTATION MODELS
+# ─────────────────────────────────────────────
+
+class AnnotationTerm(BaseModel):
+    term: str
+    definition: str
+    start: int                  # character offset in original paragraph
+    end: int                    # character offset in original paragraph
+
+class AnnotateRequest(BaseModel):
+    paragraph: str
+    specific_genre: str = "general"
+    genre_difficulty: float = 0.5
+
+class AnnotateResponse(BaseModel):
+    terms: List[AnnotationTerm]
 
 
 # ─────────────────────────────────────────────
@@ -275,8 +299,6 @@ Article excerpt:
 # SCRAPING HELPERS
 # ─────────────────────────────────────────────
 
-# Universal boilerplate patterns that apply across all sites.
-# Kept deliberately short — we want to under-filter, not over-filter.
 UNIVERSAL_SKIP = [
     'subscribe', 'sign up for', 'newsletter', 'share this',
     'follow us on', 'image:', 'photo credit:', 'advertisement',
@@ -284,15 +306,9 @@ UNIVERSAL_SKIP = [
 ]
 
 def clean_paragraphs(raw_text: str) -> list:
-    """
-    Respect trafilatura's paragraph boundaries (\n\n) directly instead
-    of re-splitting on every newline. Only filters universal boilerplate.
-    Min word count is 8 — low enough to keep short but valid sentences.
-    """
     paragraphs = raw_text.split('\n\n')
     cleaned = []
     for para in paragraphs:
-        # Collapse any internal line-wrapping the scraper left behind
         para = ' '.join(para.split()).strip()
         if len(para.split()) < 8:
             continue
@@ -303,11 +319,6 @@ def clean_paragraphs(raw_text: str) -> list:
 
 
 def scrape_with_newspaper(url: str) -> tuple:
-    """
-    Fallback scraper using newspaper3k.
-    Only called when trafilatura returns empty content.
-    Returns (title, raw_text) or raises on failure.
-    """
     from newspaper import Article
     article = Article(url)
     article.download()
@@ -326,7 +337,7 @@ def scrape_with_newspaper(url: str) -> tuple:
 async def root():
     return {
         "status": "AIRIA SNN Backend Running",
-        "version": "3.3",
+        "version": "3.4",
         "storage": "stateless — all user data in browser localStorage",
         "snn_mode": "temporal per-paragraph + end-of-session snapshot"
     }
@@ -450,71 +461,182 @@ async def retrain(data: RetrainRequest):
 
 @app.post("/intervene", response_model=InterventionResponse)
 async def intervene(data: InterventionRequest):
+    """
+    Called when the SNN spikes too_hard mid-article.
+
+    Both levels show a primer first. The primer is identical across levels —
+    it gives the user the background knowledge the paragraph assumes.
+    If the primer is not enough, the rewrite is available as a fallback.
+
+    The only thing that changes between levels is rewrite strength:
+      Level 2 (0.5 - 0.7): moderate rewrite — simpler vocabulary and
+        shorter sentences, original structure preserved.
+      Level 3 (> 0.7): aggressive rewrite — paragraph fully reconstructed
+        for maximum clarity, structure not preserved.
+
+    Server stores nothing.
+    """
     level = 3 if data.genre_difficulty > 0.7 else 2
+    rewrite_strength = "aggressive" if level == 3 else "moderate"
 
-    if level == 2:
-        prompt = f"""You are a reading assistant helping someone who is struggling with a paragraph.
+    # ── Primer prompt — identical across both levels ──────────────────────────
+    # The primer gives the user the background knowledge the paragraph assumes.
+    # It is shown first, before the rewrite, so the user can try the original again.
+    primer_prompt = f"""You are a reading assistant. A user is struggling with a paragraph from a {data.specific_genre} article.
 
-Rewrite the following paragraph in simpler language. Preserve all the key information and meaning — just make it easier to read. Use shorter sentences, simpler vocabulary, and avoid jargon where possible. Do not add new information or change the facts.
+Your job is to write a short background knowledge card — 2 to 4 sentences — that gives the reader just enough context to understand the paragraph. Do not summarize the paragraph. Instead, explain the underlying concept or domain knowledge it assumes the reader already has.
 
-Genre: {data.specific_genre}
+Think of it as answering: "What would someone need to already know to understand this paragraph?"
 
 Original paragraph:
 {data.paragraph}
 
 Respond with a JSON object with exactly two fields:
-1. "rewritten": the simplified paragraph as a plain string
-2. "annotation": one sentence explaining what made the original paragraph hard (e.g. "This paragraph uses specialized military procurement terminology that assumes prior domain knowledge.")
+1. "primer": the background knowledge card as a plain string (2-4 sentences, no jargon, plain language)
+2. "annotation": one sentence identifying the primary knowledge gap (e.g. "This paragraph assumes familiarity with how central banks use interest rates to control inflation.")
 
 Respond with ONLY valid JSON, no markdown."""
 
-    else:
-        prompt = f"""You are a reading assistant helping someone who is struggling with a dense paragraph.
+    # ── Rewrite prompt — branches on level for strength ───────────────────────
+    if level == 2:
+        rewrite_prompt = f"""You are a reading assistant helping someone who is struggling with a paragraph from a {data.specific_genre} article.
 
-The paragraph below is from a {data.specific_genre} article with high cognitive density. Rather than rewriting it entirely, identify only the hardest parts — domain-specific terms, dense syntax, or assumed background knowledge — and annotate them inline.
-
-For each hard term or phrase, add a brief clarification in square brackets immediately after it, like this:
-"The LIF neurons [leaky integrate-and-fire neurons — a model of how biological neurons accumulate and release electrical charge] process each input..."
-
-Keep the original text exactly as written except for the inline annotations. Do not rewrite sentences, add context before or after, or change the structure.
+Rewrite the following paragraph at a moderate simplification level. Preserve the original structure and paragraph flow. Use simpler vocabulary and break up long sentences, but keep the same organization and order of ideas. Do not add new information or remove key facts.
 
 Original paragraph:
 {data.paragraph}
 
-Respond with a JSON object with exactly two fields:
-1. "rewritten": the original paragraph with inline annotations added as described
-2. "annotation": one sentence identifying the primary source of difficulty (e.g. "This paragraph assumes familiarity with procurement law and military readiness classifications.")
+Respond with a JSON object with exactly one field:
+1. "rewritten": the simplified paragraph as a plain string
+
+Respond with ONLY valid JSON, no markdown."""
+    else:
+        rewrite_prompt = f"""You are a reading assistant helping someone who is struggling with a dense paragraph from a {data.specific_genre} article.
+
+Rewrite the following paragraph at an aggressive simplification level. Do not preserve the original structure — reconstruct it entirely for maximum clarity. Write at roughly an 8th grade reading level. Prioritize comprehension over preserving the original voice or organization. Keep all key facts but present them as simply as possible.
+
+Original paragraph:
+{data.paragraph}
+
+Respond with a JSON object with exactly one field:
+1. "rewritten": the reconstructed paragraph as a plain string
 
 Respond with ONLY valid JSON, no markdown."""
 
     try:
-        message = claude_client.messages.create(
+        # Run both Claude calls concurrently would be ideal but keeping sequential
+        # for simplicity — primer is shown first anyway so rewrite can lazy-load
+        primer_msg = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=512,
+            messages=[{"role": "user", "content": primer_prompt}]
+        )
+        primer_raw    = primer_msg.content[0].text.strip()
+        primer_result = json.loads(primer_raw)
+
+        rewrite_msg = claude_client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": rewrite_prompt}]
         )
-        raw = message.content[0].text.strip()
-        result = json.loads(raw)
+        rewrite_raw    = rewrite_msg.content[0].text.strip()
+        rewrite_result = json.loads(rewrite_raw)
 
         return InterventionResponse(
             level=level,
-            rewritten=result["rewritten"],
-            annotation=result.get("annotation", "")
+            rewrite_strength=rewrite_strength,
+            primer=primer_result["primer"],
+            rewritten=rewrite_result["rewritten"],
+            annotation=primer_result.get("annotation", "")
         )
 
     except Exception as e:
         print(f"Intervention failed: {e}")
         return InterventionResponse(
             level=level,
+            rewrite_strength=rewrite_strength,
+            primer="Background context unavailable for this paragraph.",
             rewritten=data.paragraph,
             annotation="Intervention unavailable — showing original paragraph."
         )
 
 
+@app.post("/annotate", response_model=AnnotateResponse)
+async def annotate(data: AnnotateRequest):
+    """
+    Annotation mode — user-initiated, runs independently of the SNN.
+
+    Called after a paragraph is completed when the user has annotation
+    mode toggled on. Claude identifies domain-specific terms and returns
+    them with definitions and character offsets so the frontend can wrap
+    the exact terms in highlight spans without modifying the paragraph text.
+
+    Only flags genuinely domain-specific terms. Common words, general
+    academic vocabulary, and terms a general reader would know are skipped.
+
+    Server stores nothing — the frontend logs annotation events to
+    airia_annotation_log in localStorage for stats and personalization.
+    """
+    prompt = f"""You are a reading assistant analyzing a paragraph from a {data.specific_genre} article (difficulty: {data.genre_difficulty:.2f} out of 1.0).
+
+Identify domain-specific terms in the paragraph that a general reader is unlikely to know. For each term, provide a short plain-language definition (one sentence, under 20 words).
+
+Rules:
+- Only flag genuinely specialized terms. Skip common words, general academic vocabulary, and anything a curious non-expert would already know.
+- Return between 0 and 6 terms. If there are no genuinely hard terms, return an empty list.
+- For each term, include the exact character position where it appears in the original paragraph (start and end index, zero-based).
+
+Original paragraph:
+{data.paragraph}
+
+Respond with a JSON object with exactly one field:
+1. "terms": an array of objects, each with "term" (string), "definition" (string), "start" (int), "end" (int)
+
+Example:
+{{"terms": [{{"term": "yield curve inversion", "definition": "When short-term bonds pay more interest than long-term ones, often signaling a coming recession.", "start": 45, "end": 66}}]}}
+
+Respond with ONLY valid JSON, no markdown."""
+
+    try:
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=768,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw    = message.content[0].text.strip()
+        result = json.loads(raw)
+
+        # Validate and clamp offsets against the actual paragraph length
+        para_len = len(data.paragraph)
+        terms = []
+        for t in result.get("terms", []):
+            start = max(0, min(int(t["start"]), para_len))
+            end   = max(start, min(int(t["end"]), para_len))
+            # Skip if the extracted term doesn't match the paragraph at those offsets
+            if data.paragraph[start:end].lower() != t["term"].lower():
+                # Try a simple search fallback before discarding
+                idx = data.paragraph.lower().find(t["term"].lower())
+                if idx == -1:
+                    continue
+                start = idx
+                end   = idx + len(t["term"])
+            terms.append(AnnotationTerm(
+                term=t["term"],
+                definition=t["definition"],
+                start=start,
+                end=end
+            ))
+
+        return AnnotateResponse(terms=terms)
+
+    except Exception as e:
+        print(f"Annotation failed: {e}")
+        return AnnotateResponse(terms=[])
+
+
 @app.post("/ingest-url", response_model=IngestURLResponse)
 async def ingest_url(data: IngestURLRequest):
     try:
-        # ── Step 1: Try trafilatura ───────────────────────────────────────────
         downloaded = trafilatura.fetch_url(data.url)
         content = None
         title = "Untitled Article"
@@ -526,15 +648,14 @@ async def ingest_url(data: IngestURLRequest):
                 include_tables=False,
                 include_images=False,
                 no_fallback=False,
-                favor_precision=False,  # loosened from True — recovers more text
-                favor_recall=True,      # flipped from False — pull more through
+                favor_precision=False,
+                favor_recall=True,
                 include_formatting=True
             )
             metadata = trafilatura.extract_metadata(downloaded)
             if metadata and metadata.title:
                 title = metadata.title
 
-        # ── Step 2: Fallback to newspaper3k if trafilatura came up empty ──────
         if not content:
             print(f"trafilatura empty for {data.url}, trying newspaper3k...")
             try:
@@ -542,18 +663,16 @@ async def ingest_url(data: IngestURLRequest):
             except Exception as ne:
                 raise ValueError(f"Both scrapers failed — trafilatura: empty, newspaper3k: {ne}")
 
-        # ── Step 3: Clean using trafilatura's own paragraph boundaries ────────
         cleaned_paragraphs = clean_paragraphs(content)
 
         if not cleaned_paragraphs:
             raise ValueError("Content extracted but all paragraphs were filtered out")
 
-        clean_content = '\n\n'.join(cleaned_paragraphs)
-        word_count = len(clean_content.split())
+        clean_content   = '\n\n'.join(cleaned_paragraphs)
+        word_count      = len(clean_content.split())
         paragraph_count = len(cleaned_paragraphs)
 
-        # ── Step 4: Lexile estimate + Claude classification ───────────────────
-        fk_grade = textstat.flesch_kincaid_grade(clean_content)
+        fk_grade        = textstat.flesch_kincaid_grade(clean_content)
         estimated_lexile = max(200, min(1600, int(fk_grade * 100 + 200)))
 
         classification = {}
