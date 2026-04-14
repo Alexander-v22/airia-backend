@@ -6,4 +6,5 @@ trafilatura
 textstat
 anthropic
 newspaper3k
-pymupdfpython-multipart
+pymupdf
+python-multipart
