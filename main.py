@@ -253,6 +253,10 @@ class BaseWeightsResponse(BaseModel):
 class IngestURLRequest(BaseModel):
     url: str
 
+class IngestTextRequest(BaseModel):
+    text: str
+    title: Optional[str] = None
+
 class IngestURLResponse(BaseModel):
     status: str
     title: str
@@ -374,6 +378,39 @@ def scrape_with_newspaper(url: str) -> tuple:
         raise ValueError("newspaper3k returned empty content")
     title = article.title or "Untitled Article"
     return title, article.text
+
+
+def process_article_content(content: str, title: str) -> IngestURLResponse:
+    """Shared processing pipeline used by both /ingest-url and /ingest-text."""
+    cleaned_paragraphs = clean_paragraphs(content)
+    if not cleaned_paragraphs:
+        raise ValueError("Content extracted but all paragraphs were filtered out")
+
+    clean_content   = '\n\n'.join(cleaned_paragraphs)
+    word_count      = len(clean_content.split())
+    paragraph_count = len(cleaned_paragraphs)
+    fk_grade        = textstat.flesch_kincaid_grade(clean_content)
+    estimated_lexile = max(200, min(1600, int(fk_grade * 100 + 200)))
+
+    classification = {}
+    try:
+        classification = classify_text_with_claude(clean_content)
+    except Exception as ce:
+        print(f"Classification failed: {ce}")
+        classification = {"broad_genre": "other", "specific_genre": "unknown", "genre_difficulty": 0.5, "reasoning": "Classification unavailable"}
+
+    article_id = f"article_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
+    return IngestURLResponse(
+        status="success",
+        title=title,
+        content=clean_content,
+        estimated_lexile=estimated_lexile,
+        word_count=word_count,
+        paragraph_count=paragraph_count,
+        article_id=article_id,
+        classification=classification,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -638,27 +675,19 @@ async def ingest_url(data: IngestURLRequest):
             except Exception as ne:
                 raise ValueError(f"Both scrapers failed — trafilatura: empty, newspaper3k: {ne}")
 
-        cleaned_paragraphs = clean_paragraphs(content)
-        if not cleaned_paragraphs:
-            raise ValueError("Content extracted but all paragraphs were filtered out")
+        return process_article_content(content, title)
 
-        clean_content    = '\n\n'.join(cleaned_paragraphs)
-        word_count       = len(clean_content.split())
-        paragraph_count  = len(cleaned_paragraphs)
-        fk_grade         = textstat.flesch_kincaid_grade(clean_content)
-        estimated_lexile = max(200, min(1600, int(fk_grade * 100 + 200)))
+    except Exception as e:
+        return IngestURLResponse(status="error", title="Error", content=str(e), estimated_lexile=0, word_count=0, paragraph_count=0, article_id="", classification={})
 
-        classification = {}
-        try:
-            classification = classify_text_with_claude(clean_content)
-        except Exception as ce:
-            print(f"Classification failed: {ce}")
-            classification = {"broad_genre": "other", "specific_genre": "unknown", "genre_difficulty": 0.5, "reasoning": "Classification unavailable"}
 
-        article_id = f"article_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-
-        return IngestURLResponse(status="success", title=title, content=clean_content, estimated_lexile=estimated_lexile, word_count=word_count, paragraph_count=paragraph_count, article_id=article_id, classification=classification)
-
+@app.post("/ingest-text", response_model=IngestURLResponse)
+async def ingest_text(data: IngestTextRequest):
+    try:
+        if not data.text or not data.text.strip():
+            raise ValueError("text field is empty")
+        title = data.title.strip() if data.title and data.title.strip() else "Untitled Article"
+        return process_article_content(data.text, title)
     except Exception as e:
         return IngestURLResponse(status="error", title="Error", content=str(e), estimated_lexile=0, word_count=0, paragraph_count=0, article_id="", classification={})
 
