@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import torch
@@ -14,7 +14,11 @@ import anthropic
 import os
 import io
 import base64
+import tempfile
+import statistics
+import re
 from typing import Optional, List
+import fitz  # PyMuPDF
 
 app = FastAPI(title="AIRIA SNN Backend")
 
@@ -284,6 +288,22 @@ class AnnotateRequest(BaseModel):
 
 class AnnotateResponse(BaseModel):
     terms: List[AnnotationTerm]
+
+class CalibrationArticle(BaseModel):
+    # "too_hard", "just_right", "comfortable", or "too_easy"
+    difficulty_rating: str
+    avg_wpm: float
+
+class CalibrateRequest(BaseModel):
+    articles: List[CalibrationArticle]
+
+class CalibrateResponse(BaseModel):
+    charge_threshold: float
+    slowdown_threshold: float
+
+class ExtractPDFResponse(BaseModel):
+    text: str
+    page_count: int
 
 
 # ─────────────────────────────────────────────
@@ -641,6 +661,88 @@ async def ingest_url(data: IngestURLRequest):
 
     except Exception as e:
         return IngestURLResponse(status="error", title="Error", content=str(e), estimated_lexile=0, word_count=0, paragraph_count=0, article_id="", classification={})
+
+
+@app.post("/extract-pdf", response_model=ExtractPDFResponse)
+async def extract_pdf(file: UploadFile = File(...)):
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        doc = fitz.open(tmp_path)
+        page_count = doc.page_count
+
+        raw_blocks = []
+        for page in doc:
+            for block in page.get_text("blocks"):
+                # block: (x0, y0, x1, y1, text, block_no, block_type); type 0 = text
+                if block[6] == 0:
+                    raw_blocks.append(block[4])
+        doc.close()
+
+        raw_text = "\n".join(raw_blocks)
+
+        # Rejoin hyphenated line breaks (e.g. "compre-\nhension" → "comprehension")
+        text = re.sub(r'(\w)-\n(\w)', r'\1\2', raw_text)
+        # Strip lines that are lone page numbers
+        text = re.sub(r'(?m)^\s*\d{1,4}\s*$', '', text)
+        # Collapse single newlines within paragraphs into spaces; preserve double newlines
+        text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
+        # Collapse runs of spaces
+        text = re.sub(r' {2,}', ' ', text)
+        text = text.strip()
+
+        if len(text) < 100:
+            raise HTTPException(status_code=422, detail="PDF appears to be scanned. OCR not supported.")
+
+        return ExtractPDFResponse(text=text, page_count=page_count)
+
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+@app.post("/calibrate", response_model=CalibrateResponse)
+async def calibrate(data: CalibrateRequest):
+    """
+    Called after the 3rd calibration article. Derives per-user SNN thresholds
+    from article difficulty ratings and WPM spread, then returns them for the
+    frontend to persist in airia_user_profile (localStorage).
+    """
+    COMFORTABLE_RATINGS = {"comfortable", "just_right", "too_easy"}
+
+    too_hard_count  = sum(1 for a in data.articles if a.difficulty_rating == "too_hard")
+    comfortable_count = sum(1 for a in data.articles if a.difficulty_rating in COMFORTABLE_RATINGS)
+
+    if too_hard_count >= 2:
+        charge_threshold = 0.55
+    elif comfortable_count >= 2:
+        charge_threshold = 0.78
+    else:
+        charge_threshold = 0.68
+
+    wpms = [a.avg_wpm for a in data.articles]
+    wpm_std = statistics.stdev(wpms) if len(wpms) >= 2 else 0.0
+
+    if wpm_std > 60:
+        slowdown_threshold = 0.82
+    elif wpm_std < 25:
+        slowdown_threshold = 0.68
+    else:
+        slowdown_threshold = 0.75
+
+    return CalibrateResponse(
+        charge_threshold=charge_threshold,
+        slowdown_threshold=slowdown_threshold
+    )
 
 
 if __name__ == "__main__":
