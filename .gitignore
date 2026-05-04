@@ -1,0 +1,17 @@
+.venv/
+venv
+__pycache__/
+*.pyc
+*.so
+*.pt
+*.pth
+*.ckpt
+build/
+sim/
+runs/
+.Xil/
+.env
+prototype.py/
+.env
+.env
+src/.env
